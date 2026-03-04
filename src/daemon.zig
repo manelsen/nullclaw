@@ -21,6 +21,7 @@ const channel_adapters = @import("channel_adapters.zig");
 const heartbeat_mod = @import("heartbeat.zig");
 const onboard = @import("onboard.zig");
 const streaming = @import("streaming.zig");
+const tools_mod = @import("tools/root.zig");
 const ConversationContext = @import("agent/prompt.zig").ConversationContext;
 
 const log = std.log.scoped(.daemon);
@@ -599,6 +600,20 @@ fn resolveTypingRecipient(
     return allocator.dupe(u8, chat_id) catch null;
 }
 
+fn setScheduleToolContextForInbound(
+    tools: []const tools_mod.Tool,
+    channel: []const u8,
+    chat_id: []const u8,
+) void {
+    for (tools) |tool| {
+        if (std.mem.eql(u8, tool.name(), "schedule")) {
+            const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
+            schedule_tool.setContext(channel, if (chat_id.len > 0) chat_id else null);
+            break;
+        }
+    }
+}
+
 fn sendInboundProcessingIndicator(
     allocator: std.mem.Allocator,
     registry: *const dispatch.ChannelRegistry,
@@ -716,6 +731,7 @@ fn inboundDispatcherThread(
             .account_id = outbound_account_id,
             .chat_id = msg.chat_id,
         };
+        setScheduleToolContextForInbound(runtime.tools, msg.channel, msg.chat_id);
         const conversation_context: ?ConversationContext = buildInboundConversationContext(&msg, parsed_meta.fields);
 
         const reply = runtime.session_mgr.processMessageStreaming(
@@ -1697,6 +1713,23 @@ test "buildInboundConversationContext derives group details from metadata" {
     try std.testing.expect(ctx.is_group != null);
     try std.testing.expect(ctx.is_group.?);
     try std.testing.expectEqualStrings("120363000000000000@g.us", ctx.group_id.?);
+}
+
+test "setScheduleToolContextForInbound propagates whatsapp_web context into schedule tool" {
+    var schedule_tool = tools_mod.schedule.ScheduleTool{};
+    defer schedule_tool.setContext(null, null);
+    const schedule_iface = schedule_tool.tool();
+    const tools = [_]tools_mod.Tool{schedule_iface};
+
+    setScheduleToolContextForInbound(tools[0..], "whatsapp_web", "5511999999999");
+
+    const parsed = try tools_mod.parseTestArgs("{\"action\":\"list\"}");
+    defer parsed.deinit();
+
+    const ctx = tools_mod.schedule.ScheduleTool.resolveDeliveryContextForTest(parsed.value.object);
+    try std.testing.expectEqualStrings("whatsapp_web", ctx.channel);
+    try std.testing.expect(ctx.chat_id != null);
+    try std.testing.expectEqualStrings("5511999999999", ctx.chat_id.?);
 }
 
 test "resolveSlackStatusTarget prefers thread_id then falls back to message_id" {

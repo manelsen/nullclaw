@@ -31,11 +31,11 @@ const Atomic = @import("portable_atomic.zig").Atomic;
 const log = std.log.scoped(.channel_loop);
 
 /// Set ScheduleTool's default chat_id for delivery context.
-fn setScheduleToolContext(tools: []const tools_mod.Tool, chat_id: []const u8) void {
+fn setScheduleToolContext(tools: []const tools_mod.Tool, channel: []const u8, chat_id: []const u8) void {
     for (tools) |tool| {
         if (std.mem.eql(u8, tool.name(), "schedule")) {
             const schedule_tool: *tools_mod.schedule.ScheduleTool = @ptrCast(@alignCast(tool.ptr));
-            schedule_tool.setContext("telegram", chat_id);
+            schedule_tool.setContext(channel, chat_id);
             break;
         }
     }
@@ -65,7 +65,7 @@ fn processTelegramMessage(
     defer tg_ptr.stopTyping(typing_target) catch {};
 
     // Set ScheduleTool context for delivery
-    setScheduleToolContext(runtime.tools, sender);
+    setScheduleToolContext(runtime.tools, "telegram", sender);
 
     // Build conversation context for Telegram
     const conversation_context: ?ConversationContext = .{

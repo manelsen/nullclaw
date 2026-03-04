@@ -10,13 +10,18 @@ const loadScheduler = @import("cron_add.zig").loadScheduler;
 threadlocal var tls_schedule_channel: ?[]const u8 = null;
 threadlocal var tls_schedule_chat_id: ?[]const u8 = null;
 
+pub const DeliveryContext = struct {
+    channel: []const u8,
+    chat_id: ?[]const u8,
+};
+
 /// Schedule tool — lets the agent manage recurring and one-shot scheduled tasks.
 /// Delegates to the CronScheduler from the cron module for persistent job management.
 pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
-    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Optional: chat_id for Telegram delivery";
+    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Optional: chat_id for channel delivery context";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID"},"chat_id":{"type":"string","description":"Chat ID for delivery notification (e.g. Telegram chat_id)"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID"},"chat_id":{"type":"string","description":"Chat ID for delivery notification in the current channel"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -26,6 +31,17 @@ pub const ScheduleTool = struct {
         _ = self;
         tls_schedule_channel = channel;
         tls_schedule_chat_id = chat_id;
+    }
+
+    fn resolveDeliveryContext(args: JsonObjectMap) DeliveryContext {
+        return .{
+            .chat_id = root.getString(args, "chat_id") orelse tls_schedule_chat_id,
+            .channel = tls_schedule_channel orelse "telegram",
+        };
+    }
+
+    pub fn resolveDeliveryContextForTest(args: JsonObjectMap) DeliveryContext {
+        return resolveDeliveryContext(args);
     }
 
     pub fn tool(self: *ScheduleTool) Tool {
@@ -40,9 +56,10 @@ pub const ScheduleTool = struct {
         const action = root.getString(args, "action") orelse
             return ToolResult.fail("Missing 'action' parameter");
 
-        // Prefer explicit args; otherwise use per-thread context injected by channel_loop.
-        const chat_id = root.getString(args, "chat_id") orelse tls_schedule_chat_id;
-        const delivery_channel = tls_schedule_channel orelse "telegram";
+        // Prefer explicit args; otherwise use per-thread context injected by runtime.
+        const delivery_ctx = resolveDeliveryContext(args);
+        const chat_id = delivery_ctx.chat_id;
+        const delivery_channel = delivery_ctx.channel;
 
         if (std.mem.eql(u8, action, "list")) {
             var scheduler = loadScheduler(allocator) catch {
@@ -243,6 +260,33 @@ test "schedule schema has action" {
     const t = st.tool();
     const schema = t.parametersJson();
     try std.testing.expect(std.mem.indexOf(u8, schema, "action") != null);
+}
+
+test "schedule context falls back to telegram when unset" {
+    var st = ScheduleTool{};
+    st.setContext(null, null);
+
+    const parsed = try root.parseTestArgs("{\"action\":\"list\"}");
+    defer parsed.deinit();
+
+    const ctx = ScheduleTool.resolveDeliveryContextForTest(parsed.value.object);
+    try std.testing.expectEqualStrings("telegram", ctx.channel);
+    try std.testing.expect(ctx.chat_id == null);
+}
+
+test "schedule context uses injected channel and explicit chat_id override" {
+    var st = ScheduleTool{};
+    st.setContext("whatsapp_web", "5511912345678");
+
+    const parsed = try root.parseTestArgs("{\"action\":\"once\",\"chat_id\":\"5511987654321\"}");
+    defer parsed.deinit();
+
+    const ctx = ScheduleTool.resolveDeliveryContextForTest(parsed.value.object);
+    try std.testing.expectEqualStrings("whatsapp_web", ctx.channel);
+    try std.testing.expect(ctx.chat_id != null);
+    try std.testing.expectEqualStrings("5511987654321", ctx.chat_id.?);
+
+    st.setContext(null, null);
 }
 
 test "schedule list returns success" {
