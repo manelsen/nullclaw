@@ -51,6 +51,7 @@ pub const CallbackSelection = union(enum) {
     ok: struct {
         submit_text: []u8,
         target: []u8,
+        callback_label: []u8,
     },
     not_found,
     expired,
@@ -1027,6 +1028,8 @@ pub const SlackChannel = struct {
         errdefer self.allocator.free(submit_text);
         const target = self.allocator.dupe(u8, interaction.target) catch return .invalid_option;
         errdefer self.allocator.free(target);
+        const callback_label = self.allocator.dupe(u8, interaction.options[option_index].label) catch return .invalid_option;
+        errdefer self.allocator.free(callback_label);
 
         if (shared_interactions.fetchRemove(token)) |removed| {
             removed.value.deinit();
@@ -1036,6 +1039,7 @@ pub const SlackChannel = struct {
         return .{ .ok = .{
             .submit_text = submit_text,
             .target = target,
+            .callback_label = callback_label,
         } };
     }
 
@@ -1166,6 +1170,39 @@ pub const SlackChannel = struct {
         try ensureSlackApiOk(parsed.value.object, "chat.postMessage", actual_channel);
 
         try self.registerPendingInteraction(token, target_channel, null, payload.choices);
+    }
+
+    pub fn updateInteractiveMessage(self: *SlackChannel, channel_id: []const u8, message_ts: []const u8, text: []const u8) !void {
+        const mrkdwn_text = try markdownToSlackMrkdwn(self.allocator, text);
+        defer self.allocator.free(mrkdwn_text);
+
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(self.allocator);
+        try body_list.appendSlice(self.allocator, "{\"channel\":\"");
+        try body_list.appendSlice(self.allocator, channel_id);
+        try body_list.appendSlice(self.allocator, "\",\"ts\":\"");
+        try body_list.appendSlice(self.allocator, message_ts);
+        try body_list.appendSlice(self.allocator, "\",\"text\":");
+        try root.json_util.appendJsonString(&body_list, self.allocator, mrkdwn_text);
+        try body_list.appendSlice(self.allocator, ",\"blocks\":[{\"type\":\"section\",\"text\":{\"type\":\"mrkdwn\",\"text\":");
+        try root.json_util.appendJsonString(&body_list, self.allocator, mrkdwn_text);
+        try body_list.appendSlice(self.allocator, "}}]}");
+
+        var auth_buf: [512]u8 = undefined;
+        var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+        try auth_fbs.writer().print("Authorization: Bearer {s}", .{self.normalizedBotToken()});
+        const auth_header = auth_fbs.getWritten();
+
+        const resp = root.http_util.curlPost(self.allocator, API_BASE ++ "/chat.update", body_list.items, &.{auth_header}) catch |err| {
+            log.warn("Slack chat.update failed: {}", .{err});
+            return error.SlackApiError;
+        };
+        defer self.allocator.free(resp);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, self.allocator, resp, .{}) catch return error.SlackApiError;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.SlackApiError;
+        try ensureSlackApiOk(parsed.value.object, "chat.update", channel_id);
     }
 
     /// Set Slack Assistant thread status (best-effort, errors ignored).
@@ -2145,6 +2182,7 @@ test "slack pending interactions survive across channel instances" {
         .ok => |selection| {
             defer std.testing.allocator.free(selection.submit_text);
             defer std.testing.allocator.free(selection.target);
+            defer std.testing.allocator.free(selection.callback_label);
             try std.testing.expectEqualStrings("Confirm action", selection.submit_text);
             try std.testing.expectEqualStrings("C123:1700.1", selection.target);
         },

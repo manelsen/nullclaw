@@ -2320,11 +2320,15 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"status\":\"ok\"}";
             return;
         };
+        const message_val = parsed.value.object.get("message") orelse {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
         const actions_val = parsed.value.object.get("actions") orelse {
             ctx.response_body = "{\"status\":\"ok\"}";
             return;
         };
-        if (user_val != .object or channel_val != .object or actions_val != .array or actions_val.array.items.len == 0) {
+        if (user_val != .object or channel_val != .object or message_val != .object or actions_val != .array or actions_val.array.items.len == 0) {
             ctx.response_body = "{\"status\":\"ok\"}";
             return;
         }
@@ -2336,8 +2340,12 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             ctx.response_body = "{\"status\":\"ok\"}";
             return;
         };
+        const message_ts_val = message_val.object.get("ts") orelse {
+            ctx.response_body = "{\"status\":\"ok\"}";
+            return;
+        };
         const first_action = actions_val.array.items[0];
-        if (sender_id_val != .string or callback_channel_val != .string or first_action != .object) {
+        if (sender_id_val != .string or callback_channel_val != .string or message_ts_val != .string or first_action != .object) {
             ctx.response_body = "{\"status\":\"ok\"}";
             return;
         }
@@ -2359,6 +2367,7 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
             .ok => |selection| {
                 defer ctx.req_allocator.free(selection.submit_text);
                 defer ctx.req_allocator.free(selection.target);
+                defer ctx.req_allocator.free(selection.callback_label);
 
                 var key_buf: [256]u8 = undefined;
                 const is_dm = callback_channel_val.string.len > 0 and callback_channel_val.string[0] == 'D';
@@ -2371,6 +2380,20 @@ fn handleSlackWebhookRoute(ctx: *WebhookHandlerContext) void {
                     is_dm,
                     ctx.config_opt,
                 );
+
+                const original_text = if (message_val.object.get("text")) |text_val|
+                    if (text_val == .string) text_val.string else ""
+                else
+                    "";
+                const update_text = std.fmt.allocPrint(
+                    ctx.req_allocator,
+                    "{s}\n\n_Selected: {s}_",
+                    .{ original_text, selection.callback_label },
+                ) catch null;
+                defer if (update_text) |text| ctx.req_allocator.free(text);
+                if (update_text) |text| {
+                    callback_channel.updateInteractiveMessage(callback_channel_val.string, message_ts_val.string, text) catch {};
+                }
 
                 if (ctx.state.event_bus) |eb| {
                     var meta_buf: [384]u8 = undefined;
