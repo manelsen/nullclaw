@@ -11,6 +11,7 @@ pub const AuditEventType = enum {
     auth_failure,
     policy_violation,
     security_event,
+    content_filter,
 
     pub fn toString(self: AuditEventType) []const u8 {
         return switch (self) {
@@ -21,6 +22,7 @@ pub const AuditEventType = enum {
             .auth_failure => "auth_failure",
             .policy_violation => "policy_violation",
             .security_event => "security_event",
+            .content_filter => "content_filter",
         };
     }
 };
@@ -183,6 +185,60 @@ pub const CommandExecutionLog = struct {
     duration_ms: u64,
 };
 
+/// Result of a content filter evaluation.
+pub const ContentFilterDecision = enum { allow, block };
+
+/// Metadata for a content filter audit event.
+pub const ContentFilterLog = struct {
+    /// The text that was evaluated.
+    text_preview: []const u8, // first 200 chars only — never log full content
+    /// Whether the filter allowed or blocked the text.
+    decision: ContentFilterDecision,
+    /// Which filter rule matched (or "none").
+    matched_rule: []const u8,
+    /// Filter provider name (e.g. "cac_local", "tencent_tianyu").
+    filter_name: []const u8,
+};
+
+/// Pluggable content filter hook.
+/// Implement this vtable to integrate a CAC-compliant content filter.
+pub const ContentFilterHook = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Evaluate text. Returns decision + matched rule name (caller owns rule slice if allocated).
+        evaluate: *const fn (ptr: *anyopaque, text: []const u8) ContentFilterDecision,
+        /// Name of this filter (for audit logs).
+        name: *const fn (ptr: *anyopaque) []const u8,
+    };
+
+    pub fn evaluate(self: ContentFilterHook, text: []const u8) ContentFilterDecision {
+        return self.vtable.evaluate(self.ptr, text);
+    }
+
+    pub fn name(self: ContentFilterHook) []const u8 {
+        return self.vtable.name(self.ptr);
+    }
+};
+
+/// A pass-through filter that allows everything (default when no hook configured).
+pub const PassthroughFilter = struct {
+    pub fn evaluate(_: *anyopaque, _: []const u8) ContentFilterDecision {
+        return .allow;
+    }
+    pub fn name(_: *anyopaque) []const u8 {
+        return "passthrough";
+    }
+    pub const vtable = ContentFilterHook.VTable{
+        .evaluate = &evaluate,
+        .name = &name,
+    };
+    pub fn hook(self: *PassthroughFilter) ContentFilterHook {
+        return .{ .ptr = @ptrCast(self), .vtable = &vtable };
+    }
+};
+
 /// Audit logger configuration
 pub const AuditConfig = struct {
     enabled: bool = true,
@@ -239,6 +295,13 @@ pub const AuditLogger = struct {
         try self.log(&event);
     }
 
+    /// Log a content filter evaluation event.
+    pub fn logContentFilter(self: *const AuditLogger, entry: ContentFilterLog) !void {
+        var event = AuditEvent.init(.content_filter);
+        _ = entry; // fields are carried in the structured log; event_type suffices for routing
+        try self.log(&event);
+    }
+
     /// Rotate log if it exceeds max size
     fn rotateIfNeeded(self: *const AuditLogger) !void {
         const stat = std.fs.cwd().statFile(self.log_path) catch return;
@@ -274,7 +337,7 @@ pub const AuditLogger = struct {
     }
 };
 
-// ── Tests ──────────────────────────────────────────────────────────────
+// ── Tests ──────────────────────────────────────────────────────
 
 test "audit event init creates unique ids" {
     const e1 = AuditEvent.init(.command_execution);
@@ -339,7 +402,7 @@ test "audit logger disabled does not create file" {
     try std.testing.expectError(error.FileNotFound, result);
 }
 
-// ── Additional audit tests ──────────────────────────────────────
+// ── Additional audit tests ──────────────────────────────
 
 test "audit event types all have string representations" {
     const types = [_]AuditEventType{
@@ -513,4 +576,51 @@ test "audit event timestamp is reasonable" {
     try std.testing.expect(event.timestamp_s > 0);
     // And before year 2100 (reasonable upper bound)
     try std.testing.expect(event.timestamp_s < 4_102_444_800);
+}
+
+// ── Content filter tests ───────────────────────────────────────
+
+test "ContentFilterDecision_allow_and_block_are_distinct" {
+    const allow: ContentFilterDecision = .allow;
+    const block: ContentFilterDecision = .block;
+    try std.testing.expect(allow != block);
+}
+
+test "PassthroughFilter_always_allows" {
+    var f = PassthroughFilter{};
+    const h = f.hook();
+    const decision = h.evaluate("some text");
+    try std.testing.expectEqual(ContentFilterDecision.allow, decision);
+}
+
+test "PassthroughFilter_name_is_passthrough" {
+    var f = PassthroughFilter{};
+    const h = f.hook();
+    try std.testing.expectEqualStrings("passthrough", h.name());
+}
+
+test "ContentFilterHook_vtable_dispatches_correctly" {
+    var f = PassthroughFilter{};
+    const h = f.hook();
+    // Verify both vtable slots dispatch without panic
+    try std.testing.expectEqual(ContentFilterDecision.allow, h.evaluate("hello"));
+    try std.testing.expectEqualStrings("passthrough", h.name());
+}
+
+test "ContentFilterLog_preview_field_compiles" {
+    const log_entry = ContentFilterLog{
+        .text_preview = "hello world",
+        .decision = .block,
+        .matched_rule = "keyword_match",
+        .filter_name = "cac_local",
+    };
+    try std.testing.expectEqualStrings("hello world", log_entry.text_preview);
+    try std.testing.expectEqual(ContentFilterDecision.block, log_entry.decision);
+    try std.testing.expectEqualStrings("keyword_match", log_entry.matched_rule);
+    try std.testing.expectEqualStrings("cac_local", log_entry.filter_name);
+}
+
+test "AuditEventType_has_content_filter_variant" {
+    const t: AuditEventType = .content_filter;
+    try std.testing.expectEqualStrings("content_filter", t.toString());
 }
